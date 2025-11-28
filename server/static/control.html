@@ -1,1 +1,20 @@
+<!DOCTYPE html>
+<html>
+<head>
+<title>Painel de Controle</title>
+</head>
+<body style="font-family: Arial;">
+<h1>Painel de Controle do Monitoramento</h1>
 
+<button onclick="send('start')">Iniciar Monitoramento</button>
+<button onclick="send('stop')">Parar Monitoramento</button>
+
+<script>
+function send(cmd) {
+fetch(`/api/command/` + cmd, { method: "POST" })
+.then(r => r.json())
+.then(() => alert("Comando enviado: " + cmd));
+}
+</script>
+</body>
+</html>
