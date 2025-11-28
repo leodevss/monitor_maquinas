@@ -1,0 +1,28 @@
+import sqlite3
+import psycopg2
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+
+SQLITE = "local_monitor.db"
+POSTGRES = os.getenv("DATABASE_URL")
+
+conn_sql = sqlite3.connect(SQLITE)
+cur_sql = conn_sql.cursor()
+
+conn_pg = psycopg2.connect(POSTGRES)
+cur_pg = conn_pg.cursor()
+
+cur_sql.execute("SELECT hostname, cpu, ram, timestamp FROM metricas")
+rows = cur_sql.fetchall()
+
+for row in rows:
+cur_pg.execute(
+"INSERT INTO metricas (hostname, cpu, ram, timestamp) VALUES (%s, %s, %s, %s)",
+row
+)
+
+conn_pg.commit()
+conn_pg.close()
+conn_sql.close()
