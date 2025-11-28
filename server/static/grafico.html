@@ -1,10 +1,212 @@
 <!DOCTYPE html>
 <html>
 <head>
-<title>Gráfico</title>
+<meta charset="UTF-8">
+<title>Dashboard Avançado</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<style>
+body {
+font-family: Arial;
+padding: 25px;
+background: #f5f6fa;
+}
+
+h1 {
+text-align: center;
+color: #333;
+margin-bottom: 30px;
+}
+
+.dashboard {
+display: flex;
+gap: 20px;
+justify-content: center;
+margin-bottom: 30px;
+}
+
+.card {
+background: white;
+padding: 20px;
+border-radius: 12px;
+width: 200px;
+text-align: center;
+box-shadow: 0 4px 10px rgba(0,0,0,0.1);
+}
+
+.card-title {
+font-size: 14px;
+color: #555;
+}
+
+.card-value {
+font-size: 28px;
+font-weight: bold;
+margin-top: 10px;
+}
+
+.controls {
+display: flex;
+justify-content: center;
+gap: 20px;
+margin-bottom: 20px;
+}
+
+select {
+padding: 10px;
+border-radius: 6px;
+border: 1px solid #aaa;
+font-size: 14px;
+}
+
+#grafico-container {
+width: 90%;
+max-width: 1000px;
+margin: auto;
+}
+</style>
 </head>
-<body style="font-family: Arial;">
-<h1>Gráfico de CPU e RAM</h1>
-<p>Aqui você pode integrar Chart.js ou Plotly.</p>
+
+<body>
+
+<h1>Dashboard Avançado – CPU / RAM</h1>
+
+<!-- Cards de status -->
+<div class="dashboard">
+<div class="card">
+<div class="card-title">CPU Atual</div>
+<div class="card-value" id="cpuAtual">--%</div>
+</div>
+
+<div class="card">
+<div class="card-title">RAM Atual</div>
+<div class="card-value" id="ramAtual">--%</div>
+</div>
+
+<div class="card">
+<div class="card-title">Média CPU</div>
+<div class="card-value" id="cpuMedia">--%</div>
+</div>
+
+<div class="card">
+<div class="card-title">Média RAM</div>
+<div class="card-value" id="ramMedia">--%</div>
+</div>
+</div>
+
+<!-- Controles -->
+<div class="controls">
+<select id="hostSelect"></select>
+
+<select id="limitSelect">
+<option value="20">Últimos 20 registros</option>
+<option value="50">Últimos 50 registros</option>
+<option value="100">Últimos 100 registros</option>
+</select>
+</div>
+
+<!-- Gráfico -->
+<div id="grafico-container">
+<canvas id="grafico"></canvas>
+</div>
+
+<script>
+let chart;
+
+async function carregarHosts() {
+const req = await fetch("/api/hosts");
+const hosts = await req.json();
+
+const select = document.getElementById("hostSelect");
+select.innerHTML = "";
+
+hosts.forEach(h => {
+const op = document.createElement("option");
+op.value = h;
+op.textContent = h;
+select.appendChild(op);
+});
+
+if (hosts.length > 0) {
+carregarGrafico();
+}
+}
+
+async function carregarGrafico() {
+const host = document.getElementById("hostSelect").value;
+const limit = document.getElementById("limitSelect").value;
+
+const req = await fetch(`/api/metrics?hostname=${host}&limit=${limit}`);
+const dados = await req.json();
+
+dados.sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+const labels = dados.map(i => i.timestamp.substring(11, 19));
+const cpuData = dados.map(i => i.cpu);
+const ramData = dados.map(i => i.ram);
+
+// cards:
+document.getElementById("cpuAtual").textContent = cpuData.at(-1) + "%";
+document.getElementById("ramAtual").textContent = ramData.at(-1) + "%";
+
+document.getElementById("cpuMedia").textContent =
+Math.round(cpuData.reduce((a,b)=>a+b)/cpuData.length) + "%";
+
+document.getElementById("ramMedia").textContent =
+Math.round(ramData.reduce((a,b)=>a+b)/ramData.length) + "%";
+
+// gráfico:
+const ctx = document.getElementById("grafico");
+
+if (chart) chart.destroy();
+
+chart = new Chart(ctx, {
+type: "bar",
+data: {
+labels: labels,
+datasets: [
+{
+label: "CPU (%)",
+data: cpuData,
+backgroundColor: "rgba(54, 162, 235, 0.6)",
+borderColor: "#1e88e5",
+borderWidth: 1
+},
+{
+label: "RAM (%)",
+data: ramData,
+backgroundColor: "rgba(255, 99, 132, 0.6)",
+borderColor: "#e53935",
+borderWidth: 1
+}
+]
+},
+options: {
+responsive: true,
+plugins: {
+legend: { position: "top" }
+},
+scales: {
+y: {
+beginAtZero: true,
+max: 100
+}
+}
+}
+});
+}
+
+// Atualiza automaticamente
+setInterval(carregarGrafico, 5000);
+
+// Quando alterar host ou quantidade de registros
+document.getElementById("hostSelect").addEventListener("change", carregarGrafico);
+document.getElementById("limitSelect").addEventListener("change", carregarGrafico);
+
+// Inicializa
+carregarHosts();
+</script>
+
 </body>
 </html>
