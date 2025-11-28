@@ -1,123 +1,144 @@
-# server/main.py
+# main.py
 import os
-import json
-import asyncio
-from concurrent.futures import ThreadPoolExecutor
+import logging
 from datetime import datetime
-from typing import Any, Dict
+from typing import Optional
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Depends, Header
 from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
-import psycopg2
-from psycopg2.extras import RealDictCursor
-from dotenv import load_dotenv
+from pydantic import BaseSettings
+import asyncpg
 
-# carrega .env se existir (útil localmente)
-load_dotenv()
+# -------------------------
+# Config
+# -------------------------
+class Settings(BaseSettings):
+    DATABASE_URL: Optional[str] = None
+    API_KEY: Optional[str] = ""
+    APP_TITLE: str = "Monitor de Recursos - Server"
 
-DATABASE_URL = os.getenv("DATABASE_URL")  # ex: postgresql://user:pass@host:5432/dbname
-API_KEY = os.getenv("API_KEY", "")
+    class Config:
+        env_file = ".env"
+        env_file_encoding = "utf-8"
 
-if not DATABASE_URL:
-    # levantamos logo, para o deploy falhar com mensagem óbvia
-    raise RuntimeError("DATABASE_URL não configurada (env var) — defina DATABASE_URL no Render / .env")
+settings = Settings()
 
-# Força SSL para Supabase (caso a URL não contenha ?sslmode)
-if "sslmode" not in DATABASE_URL:
-    if "?" in DATABASE_URL:
-        DATABASE_URL = DATABASE_URL + "&sslmode=require"
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("monitor-server")
+
+if not settings.DATABASE_URL:
+    logger.warning("DATABASE_URL não configurada (env). Endpoints de DB irão falhar.")
+
+# -------------------------
+# App & Static files
+# -------------------------
+app = FastAPI(title=settings.APP_TITLE)
+
+# Mount static directory (mais eficiente que endpoint manual)
+static_dir = os.path.join(os.path.dirname(__file__), "static")
+if not os.path.isdir(static_dir):
+    os.makedirs(static_dir, exist_ok=True)  # opcional — cria pasta para evitar erros
+app.mount("/static", StaticFiles(directory=static_dir), name="static")
+
+# -------------------------
+# Pool de conexões (asyncpg)
+# -------------------------
+db_pool: Optional[asyncpg.pool.Pool] = None
+
+@app.on_event("startup")
+async def startup():
+    global db_pool
+    if settings.DATABASE_URL:
+        try:
+            db_pool = await asyncpg.create_pool(dsn=settings.DATABASE_URL, min_size=1, max_size=10)
+            logger.info("Pool de DB criado com sucesso.")
+        except Exception as e:
+            db_pool = None
+            logger.error(f"Falha ao criar pool de DB: {e}")
     else:
-        DATABASE_URL = DATABASE_URL + "?sslmode=require"
+        logger.warning("DATABASE_URL ausente — pool de DB não criado.")
 
-app = FastAPI(title="Monitor de Recursos Computacionais")
+@app.on_event("shutdown")
+async def shutdown():
+    global db_pool
+    if db_pool:
+        await db_pool.close()
+        logger.info("Pool de DB fechado.")
 
-# Serve arquivos estáticos em /static (coloque grafico.html e control.html em server/static/)
-app.mount("/static", StaticFiles(directory="server/static"), name="static")
-
-executor = ThreadPoolExecutor(max_workers=2)
-
-def sync_db_ping() -> Dict[str, Any]:
+# -------------------------
+# Helpers
+# -------------------------
+def require_api_key(x_api_key: Optional[str] = Header(None)):
     """
-    Função síncrona que testa conexão com o banco e retorna NOW().
-    Executada em threadpool para não bloquear o loop async do FastAPI.
+    Dependência simples para proteger endpoints sensíveis.
+    Você pode enviar header: X-API-KEY: <sua chave>
     """
-    conn = None
-    try:
-        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
-        cur = conn.cursor(cursor_factory=RealDictCursor)
-        cur.execute("SELECT NOW() as now_time;")
-        row = cur.fetchone()
-        cur.close()
-        return {"ok": True, "now": row["now_time"].isoformat()}
-    finally:
-        if conn:
-            conn.close()
+    if not settings.API_KEY:
+        # chave não configurada -> não exigir (modo dev)
+        return True
+    if not x_api_key or x_api_key != settings.API_KEY:
+        raise HTTPException(status_code=401, detail="API key inválida")
+    return True
 
+# -------------------------
+# Endpoints
+# -------------------------
 @app.get("/", response_class=HTMLResponse)
 async def index():
-    """
-    Página inicial simples que redireciona/explica.
-    Se você quiser abrir o controle: /static/control.html
-    Para o gráfico: /static/grafico.html
-    """
-    html = f"""
-    <html>
-      <head><meta charset="utf-8"><title>Monitor de Recursos</title></head>
-      <body style="font-family:Arial,Helvetica,sans-serif">
-        <h2>Monitor de Recursos</h2>
-        <p>Ruas rápidas:</p>
-        <ul>
-          <li><a href="/static/control.html" target="_blank">Tela Controle (control.html)</a></li>
-          <li><a href="/static/grafico.html" target="_blank">Gráfico (grafico.html)</a></li>
-          <li><a href="/api/db_ping">Testar conexão com o banco (API)</a></li>
-        </ul>
-        <small>Deploy time: {datetime.utcnow().isoformat()} UTC</small>
-      </body>
-    </html>
+    html = """
+    <html><head><meta charset="utf-8"><title>Monitor</title></head>
+    <body>
+      <h2>Monitor de Recursos - Servidor</h2>
+      <p><a href="/static/grafico.html">Abrir gráfico</a></p>
+      <p><a href="/health">Health check</a></p>
+      <p><a href="/db_test">Testar conexão DB</a> (gera/insere/conta)</p>
+    </body></html>
     """
     return HTMLResponse(html)
 
-@app.get("/api/db_ping")
-async def db_ping():
-    """
-    Endpoint para testar se o backend consegue conectar ao banco (Supabase).
-    Útil no Render / mobile para confirmar que a variável DATABASE_URL foi aplicada.
-    """
-    loop = asyncio.get_running_loop()
-    try:
-        result = await loop.run_in_executor(executor, sync_db_ping)
-        return JSONResponse(result)
-    except Exception as e:
-        # devolve detalhe para debug (não exponha em produção sem sanitizar)
-        raise HTTPException(status_code=500, detail=f"DB ping failed: {e}")
-
-@app.get("/api/health")
+@app.get("/health")
 async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
 
-# --- exemplo de endpoint para receber medições (se quiser) ---
-class Medicao(BaseModel):
-    client_id: str
-    timestamp: str  # isoformat
-    cpu: float
-    ram: float
-
-@app.post("/api/medicao")
-async def receber_medicao(m: Medicao):
+@app.get("/db_test")
+async def db_test(_=Depends(require_api_key)):
     """
-    Endpoint simples para aceitar uma medição. Por enquanto apenas retorna OK.
-    No futuro você salva no banco (INSERT) aqui.
+    Testa conexão com o banco:
+    - cria tabela de teste se não existir
+    - insere uma linha com timestamp e cpu%, ram%
+    - retorna a contagem de linhas da tabela
     """
-    # Exemplo mínimo de validação
-    if not m.client_id:
-        raise HTTPException(status_code=400, detail="client_id missing")
-    # TODO: salvar no banco (async/worker)
-    return {"received": True, "client": m.client_id, "ts": m.timestamp}
+    global db_pool
+    if not db_pool:
+        raise HTTPException(status_code=500, detail="Pool de DB não disponível. Verifique DATABASE_URL e logs.")
 
-# permite rodar localmente com python server/main.py
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run("server.main:app", host="0.0.0.0", port=8000, reload=True)
+    async with db_pool.acquire() as conn:
+        # usar transação para segurança
+        async with conn.transaction():
+            # criar tabela (apenas para teste; use migrations em produção)
+            await conn.execute("""
+                CREATE TABLE IF NOT EXISTS measurements_test (
+                    id SERIAL PRIMARY KEY,
+                    ts TIMESTAMP NOT NULL,
+                    cpu_percent REAL,
+                    ram_percent REAL
+                );
+            """)
+            # inserir registro exemplo
+            row_id = await conn.fetchval(
+                "INSERT INTO measurements_test (ts, cpu_percent, ram_percent) VALUES (NOW(), $1, $2) RETURNING id;",
+                12.34, 56.78
+            )
+            total = await conn.fetchval("SELECT COUNT(*)::int FROM measurements_test;")
+    return {"inserted_id": int(row_id), "total_rows": int(total)}
 
+# rota alternativa para conferir arquivo estático (caso queira)
+@app.get("/static-check", response_class=HTMLResponse)
+async def static_check():
+    fp = os.path.join(static_dir, "grafico.html")
+    if not os.path.isfile(fp):
+        return HTMLResponse("<h3>grafico.html não encontrado em static/</h3>", status_code=404)
+    with open(fp, "r", encoding="utf-8") as f:
+        return HTMLResponse(f.read())
