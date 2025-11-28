@@ -1,0 +1,17 @@
+# virtual envs
+venv/
+server/venv/
+agent/venv/
+
+# sensitive files
+.env
+server/.env
+agent/.env
+
+# python cache
+__pycache__/
+*.pyc
+
+# IDE
+.vscode/
+.idea/
