@@ -1,271 +1,200 @@
 import os
+from pathlib import Path
 from typing import List, Optional
-from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
 from datetime import datetime
+import logging
+
+from fastapi import FastAPI, HTTPException, Request, status
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import BaseModel, validator
 import psycopg2
-from psycopg2.extras import RealDictCursor
+from psycopg2.extras import execute_values
 from dotenv import load_dotenv
 
-load_dotenv() # carrega DATABASE_URL e API_KEY de .env
+# load .env in local/dev (Render ignores this and uses env vars configured in dashboard)
+load_dotenv()
 
-DATABASE_URL = os.getenv("DATABASE_URL")
-API_KEY = os.getenv("API_KEY", None) # opcional: se definido, protege operações administrativas
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("monitor_server")
+
+DATABASE_URL = os.getenv("DATABASE_URL") # expected: postgresql://user:pass@host:5432/dbname
+API_KEY = os.getenv("API_KEY") # optional, if you want to protect agent ingestion
 
 if not DATABASE_URL:
+# In deploy we want this to fail loud so you set env var in Render
+logger.error("DATABASE_URL não configurada (env var).")
+# do not raise here if you want app to start but we prefer to raise so Render build shows error
 raise RuntimeError("DATABASE_URL não configurada (env var)")
 
-app = FastAPI(title="Monitor Collector API")
-
-# serve arquivos estáticos em server/static (control.html, grafico.html, etc.)
-app.mount("/static", StaticFiles(directory="server/static"), name="static")
-
-
-# ---------- utilitários ----------
+# ---------- DB helpers ----------
 def get_conn():
-"""Retorna conexão psycopg2 (não esquecer de fechar)."""
-return psycopg2.connect(DATABASE_URL)
-
+# For Supabase require sslmode=require occasionally required
+conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+return conn
 
 def init_db():
-"""Cria tabelas necessárias caso não existam."""
-conn = get_conn()
-cur = conn.cursor()
-cur.execute(
-"""
+"""Cria tabela se não existir."""
+sql = """
 CREATE TABLE IF NOT EXISTS metricas (
 id SERIAL PRIMARY KEY,
-hostname TEXT NOT NULL,
-ts TIMESTAMP NOT NULL,
+data_hora TIMESTAMP NOT NULL,
 cpu REAL NOT NULL,
 ram REAL NOT NULL
 );
 """
-)
-cur.execute(
-"""
-CREATE TABLE IF NOT EXISTS comandos (
-client_id TEXT PRIMARY KEY,
-command TEXT,
-updated_at TIMESTAMP
-);
-"""
-)
+conn = get_conn()
+try:
+cur = conn.cursor()
+cur.execute(sql)
 conn.commit()
 cur.close()
+logger.info("Tabela metricas garantida.")
+finally:
 conn.close()
 
+def insert_batch(rows: List[tuple]):
+"""
+rows: list of (datetime, cpu, ram) where datetime is a python datetime or string
+"""
+if not rows:
+return 0
+conn = get_conn()
+try:
+cur = conn.cursor()
+execute_values(
+cur,
+"INSERT INTO metricas (data_hora, cpu, ram) VALUES %s",
+rows
+)
+conn.commit()
+count = cur.rowcount
+cur.close()
+logger.info(f"{len(rows)} registros inseridos.")
+return len(rows)
+finally:
+conn.close()
 
-@app.on_event("startup")
-def startup_event():
-init_db()
+def query_latest(limit: int = 100):
+conn = get_conn()
+try:
+cur = conn.cursor()
+cur.execute(
+"SELECT id, data_hora, cpu, ram FROM metricas ORDER BY data_hora DESC LIMIT %s",
+(limit,)
+)
+rows = cur.fetchall()
+cur.close()
+return rows
+finally:
+conn.close()
 
-
-# ---------- modelos ----------
-class CollectPayload(BaseModel):
-hostname: str
-timestamp: Optional[str] = None # ISO string; se ausente, servidor usa NOW()
+# ---------- Pydantic models ----------
+class Medicao(BaseModel):
+data_hora: str # "YYYY-MM-DD HH:MM:SS" or ISO
 cpu: float
 ram: float
 
-
-# ---------- endpoints principais ----------
-@app.post("/api/collect")
-def collect(payload: CollectPayload):
-"""
-Recebe medições do agent.
-payload.timestamp pode ser ISO string; se inválido/ausente usamos NOW().
-"""
-ts = None
-if payload.timestamp:
+@validator("data_hora")
+def parse_dt(cls, v):
+# Accept common formats; keep as string here and parse later
 try:
-ts = datetime.fromisoformat(payload.timestamp)
+# try ISO first
+datetime.fromisoformat(v)
 except Exception:
-ts = None
-
-conn = get_conn()
-cur = conn.cursor()
-if ts:
-cur.execute(
-"INSERT INTO metricas (hostname, ts, cpu, ram) VALUES (%s, %s, %s, %s)",
-(payload.hostname, ts, payload.cpu, payload.ram),
-)
-else:
-# usa NOW() no SQL se timestamp inválido/ausente
-cur.execute(
-"INSERT INTO metricas (hostname, ts, cpu, ram) VALUES (%s, NOW(), %s, %s)",
-(payload.hostname, payload.cpu, payload.ram),
-)
-conn.commit()
-cur.close()
-conn.close()
-return {"status": "ok"}
-
-
-@app.get("/api/metrics")
-def get_metrics(hostname: Optional[str] = None, limit: int = 30):
-"""
-Retorna medições (JSON) ordenadas do mais antigo ao mais recente:
-/api/metrics?hostname=pc-01&limit=50
-"""
-# defensiva: limitar tamanho máximo
+# try fallback
 try:
-limit = int(limit)
+datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
 except Exception:
-limit = 30
-if limit <= 0:
-limit = 30
-if limit > 1000:
-limit = 1000
+raise ValueError("Formato data_hora inválido. Use ISO ou 'YYYY-MM-DD HH:MM:SS'")
+return v
 
-conn = get_conn()
-cur = conn.cursor(cursor_factory=RealDictCursor)
+class BatchIn(BaseModel):
+measurements: List[Medicao]
+api_key: Optional[str] = None
 
-if hostname:
-cur.execute(
-"""
-SELECT ts as timestamp, cpu, ram
-FROM metricas
-WHERE hostname = %s
-ORDER BY ts DESC
-LIMIT %s
-""",
-(hostname, limit),
-)
-else:
-cur.execute(
-"""
-SELECT ts as timestamp, cpu, ram
-FROM metricas
-ORDER BY ts DESC
-LIMIT %s
-""",
-(limit,),
-)
+# ---------- App ----------
+app = FastAPI(title="Monitor de Recursos - Server")
 
-rows = cur.fetchall()
-cur.close()
-conn.close()
+# serve static files from ./static at /static
+HERE = Path(__file__).parent
+STATIC_DIR = HERE / "static"
+if not STATIC_DIR.exists():
+STATIC_DIR.mkdir(parents=True, exist_ok=True)
+app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
 
-# rows já em desc order; queremos enviar do mais antigo ao mais recente para o frontend
-rows.reverse()
-# converte timestamp para ISO string (se for datetime)
-for r in rows:
-if isinstance(r["timestamp"], datetime):
-r["timestamp"] = r["timestamp"].isoformat()
-return JSONResponse(content=rows)
+# init DB on startup
+@app.on_event("startup")
+def on_startup():
+logger.info("Inicializando DB...")
+init_db()
+logger.info("Startup completo.")
 
+# Health
+@app.get("/health")
+def health():
+return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
 
-@app.get("/api/hosts")
-def get_hosts():
-"""Retorna lista com hostnames únicos (para popular o dropdown)."""
-conn = get_conn()
-cur = conn.cursor()
-cur.execute("SELECT DISTINCT hostname FROM metricas ORDER BY hostname")
-rows = cur.fetchall()
-cur.close()
-conn.close()
-hosts = [r[0] for r in rows]
-return JSONResponse(content=hosts)
-
-
-# ---------- comandos remotos ----------
-@app.get("/api/command/{client_id}")
-def get_command(client_id: str):
-"""Agent consulta este endpoint para saber se deve iniciar/parar."""
-conn = get_conn()
-cur = conn.cursor(cursor_factory=RealDictCursor)
-cur.execute("SELECT command, updated_at FROM comandos WHERE client_id = %s", (client_id,))
-row = cur.fetchone()
-cur.close()
-conn.close()
-if not row:
-# por padrão, instruímos 'start' (ou poderia ser 'stop' conforme sua arquitetura)
-return {"command": "start"}
-return {"command": row["command"], "updated_at": (row["updated_at"].isoformat() if row["updated_at"] else None)}
-
-
-@app.post("/api/command/{client_id}")
-def set_command(client_id: str, request: Request, authorization: Optional[str] = Header(None)):
-"""
-Admin envia comando start/stop para um client_id.
-Se API_KEY estiver definida, espera header: Authorization: Bearer <API_KEY>
-"""
-# validar API key se existir
+# Ingest endpoint - agent posts a batch of measurements
+@app.post("/ingest", status_code=201)
+def ingest(data: BatchIn, request: Request):
+# optional API key check
 if API_KEY:
-if not authorization or API_KEY not in authorization:
-raise HTTPException(status_code=401, detail="Unauthorized")
+# prefer header X-API-KEY or data.api_key
+key_header = request.headers.get("x-api-key")
+provided = key_header or data.api_key
+if provided != API_KEY:
+raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key inválida")
 
-form = None
+rows = []
+for m in data.measurements:
+# parse datetime into python datetime
 try:
-form = await_request_json_or_form(request)
-except Exception:
-raise HTTPException(status_code=400, detail="Invalid payload")
-
-# aceita payload JSON {"command":"start"} ou form-data
-cmd = None
-if isinstance(form, dict):
-cmd = form.get("command")
-else:
-cmd = None
-
-if cmd not in ("start", "stop"):
-raise HTTPException(status_code=400, detail="Invalid command. Use 'start' or 'stop'.")
-
-conn = get_conn()
-cur = conn.cursor()
-cur.execute(
-"""
-INSERT INTO comandos (client_id, command, updated_at)
-VALUES (%s, %s, NOW())
-ON CONFLICT (client_id) DO UPDATE SET command = EXCLUDED.command, updated_at = EXCLUDED.updated_at
-""",
-(client_id, cmd),
-)
-conn.commit()
-cur.close()
-conn.close()
-return {"status": "ok", "client_id": client_id, "command": cmd}
-
-
-# pequeno helper para aceitar json ou form-data
-async def await_request_json_or_form(request: Request):
-"""
-Retorna dict com conteúdo:
-- tenta JSON primeiro, se falhar tenta form data (multipart/form-data or x-www-form-urlencoded)
-"""
+dt = None
 try:
-return await request.json()
+dt = datetime.fromisoformat(m.data_hora)
 except Exception:
+dt = datetime.strptime(m.data_hora, "%Y-%m-%d %H:%M:%S")
+rows.append((dt, float(m.cpu), float(m.ram)))
+except Exception as e:
+raise HTTPException(status_code=400, detail=f"Erro ao parsear medicao: {e}")
+
 try:
-form = await request.form()
-return dict(form)
-except Exception:
-return {}
+inserted = insert_batch(rows)
+return {"inserted": inserted}
+except Exception as e:
+logger.exception("Erro ao inserir lote")
+raise HTTPException(status_code=500, detail=str(e))
 
+# Get latest measurements (for UI)
+@app.get("/api/latest")
+def api_latest(limit: int = 100):
+try:
+rows = query_latest(limit)
+# rows are in desc order; we can reverse to ascending for plotting
+result = [
+{"id": r[0], "data_hora": r[1].isoformat(), "cpu": float(r[2]), "ram": float(r[3])}
+for r in reversed(rows)
+]
+return {"count": len(result), "data": result}
+except Exception as e:
+logger.exception("Erro ao consultar latest")
+raise HTTPException(status_code=500, detail=str(e))
 
-# ---------- rotas para UI estático ----------
-@app.get("/", response_class=HTMLResponse)
+# Convenience: serve index or grafico
+@app.get("/")
 def index():
-return {"status": "monitor-server ok"}
+index_file = STATIC_DIR / "control.html"
+if index_file.exists():
+return FileResponse(index_file)
+return {"message": "Coloque control.html em /server/static e recarregue."}
 
-
-@app.get("/control", response_class=HTMLResponse)
-def control_page():
-# serve server/static/control.html
+# small endpoint to test DB connectivity quickly
+@app.get("/db-test")
+def db_test():
 try:
-with open("server/static/control.html", "r", encoding="utf-8") as f:
-return HTMLResponse(f.read())
-except FileNotFoundError:
-return HTMLResponse("<h3>control.html não encontrado</h3>", status_code=404)
-
-
-@app.get("/grafico", response_class=HTMLResponse)
-def grafico_page():
-try:
-with open("server/static/grafico.html", "r", encoding="utf-8") as f:
-return HTMLResponse(f.read())
-except FileNotFoundError:
-return HTMLResponse("<h3>grafico.html não encontrado</h3>", status_code=404)
+rows = query_latest(1)
+return {"ok": True, "sample_count": len(rows)}
+except Exception as e:
+logger.exception("DB test falhou")
+raise HTTPException(status_code=500, detail=f"
