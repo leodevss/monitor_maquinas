@@ -1,200 +1,123 @@
+# server/main.py
 import os
-from pathlib import Path
-from typing import List, Optional
+import json
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
-import logging
+from typing import Any, Dict
 
-from fastapi import FastAPI, HTTPException, Request, status
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, validator
+from pydantic import BaseModel
 import psycopg2
-from psycopg2.extras import execute_values
+from psycopg2.extras import RealDictCursor
 from dotenv import load_dotenv
 
-# load .env in local/dev (Render ignores this and uses env vars configured in dashboard)
+# carrega .env se existir (útil localmente)
 load_dotenv()
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("monitor_server")
-
-DATABASE_URL = os.getenv("DATABASE_URL") # expected: postgresql://user:pass@host:5432/dbname
-API_KEY = os.getenv("API_KEY") # optional, if you want to protect agent ingestion
+DATABASE_URL = os.getenv("DATABASE_URL")  # ex: postgresql://user:pass@host:5432/dbname
+API_KEY = os.getenv("API_KEY", "")
 
 if not DATABASE_URL:
-# In deploy we want this to fail loud so you set env var in Render
-logger.error("DATABASE_URL não configurada (env var).")
-# do not raise here if you want app to start but we prefer to raise so Render build shows error
-raise RuntimeError("DATABASE_URL não configurada (env var)")
+    # levantamos logo, para o deploy falhar com mensagem óbvia
+    raise RuntimeError("DATABASE_URL não configurada (env var) — defina DATABASE_URL no Render / .env")
 
-# ---------- DB helpers ----------
-def get_conn():
-# For Supabase require sslmode=require occasionally required
-conn = psycopg2.connect(DATABASE_URL, sslmode="require")
-return conn
+# Força SSL para Supabase (caso a URL não contenha ?sslmode)
+if "sslmode" not in DATABASE_URL:
+    if "?" in DATABASE_URL:
+        DATABASE_URL = DATABASE_URL + "&sslmode=require"
+    else:
+        DATABASE_URL = DATABASE_URL + "?sslmode=require"
 
-def init_db():
-"""Cria tabela se não existir."""
-sql = """
-CREATE TABLE IF NOT EXISTS metricas (
-id SERIAL PRIMARY KEY,
-data_hora TIMESTAMP NOT NULL,
-cpu REAL NOT NULL,
-ram REAL NOT NULL
-);
-"""
-conn = get_conn()
-try:
-cur = conn.cursor()
-cur.execute(sql)
-conn.commit()
-cur.close()
-logger.info("Tabela metricas garantida.")
-finally:
-conn.close()
+app = FastAPI(title="Monitor de Recursos Computacionais")
 
-def insert_batch(rows: List[tuple]):
-"""
-rows: list of (datetime, cpu, ram) where datetime is a python datetime or string
-"""
-if not rows:
-return 0
-conn = get_conn()
-try:
-cur = conn.cursor()
-execute_values(
-cur,
-"INSERT INTO metricas (data_hora, cpu, ram) VALUES %s",
-rows
-)
-conn.commit()
-count = cur.rowcount
-cur.close()
-logger.info(f"{len(rows)} registros inseridos.")
-return len(rows)
-finally:
-conn.close()
+# Serve arquivos estáticos em /static (coloque grafico.html e control.html em server/static/)
+app.mount("/static", StaticFiles(directory="server/static"), name="static")
 
-def query_latest(limit: int = 100):
-conn = get_conn()
-try:
-cur = conn.cursor()
-cur.execute(
-"SELECT id, data_hora, cpu, ram FROM metricas ORDER BY data_hora DESC LIMIT %s",
-(limit,)
-)
-rows = cur.fetchall()
-cur.close()
-return rows
-finally:
-conn.close()
+executor = ThreadPoolExecutor(max_workers=2)
 
-# ---------- Pydantic models ----------
+def sync_db_ping() -> Dict[str, Any]:
+    """
+    Função síncrona que testa conexão com o banco e retorna NOW().
+    Executada em threadpool para não bloquear o loop async do FastAPI.
+    """
+    conn = None
+    try:
+        conn = psycopg2.connect(DATABASE_URL, connect_timeout=5)
+        cur = conn.cursor(cursor_factory=RealDictCursor)
+        cur.execute("SELECT NOW() as now_time;")
+        row = cur.fetchone()
+        cur.close()
+        return {"ok": True, "now": row["now_time"].isoformat()}
+    finally:
+        if conn:
+            conn.close()
+
+@app.get("/", response_class=HTMLResponse)
+async def index():
+    """
+    Página inicial simples que redireciona/explica.
+    Se você quiser abrir o controle: /static/control.html
+    Para o gráfico: /static/grafico.html
+    """
+    html = f"""
+    <html>
+      <head><meta charset="utf-8"><title>Monitor de Recursos</title></head>
+      <body style="font-family:Arial,Helvetica,sans-serif">
+        <h2>Monitor de Recursos</h2>
+        <p>Ruas rápidas:</p>
+        <ul>
+          <li><a href="/static/control.html" target="_blank">Tela Controle (control.html)</a></li>
+          <li><a href="/static/grafico.html" target="_blank">Gráfico (grafico.html)</a></li>
+          <li><a href="/api/db_ping">Testar conexão com o banco (API)</a></li>
+        </ul>
+        <small>Deploy time: {datetime.utcnow().isoformat()} UTC</small>
+      </body>
+    </html>
+    """
+    return HTMLResponse(html)
+
+@app.get("/api/db_ping")
+async def db_ping():
+    """
+    Endpoint para testar se o backend consegue conectar ao banco (Supabase).
+    Útil no Render / mobile para confirmar que a variável DATABASE_URL foi aplicada.
+    """
+    loop = asyncio.get_running_loop()
+    try:
+        result = await loop.run_in_executor(executor, sync_db_ping)
+        return JSONResponse(result)
+    except Exception as e:
+        # devolve detalhe para debug (não exponha em produção sem sanitizar)
+        raise HTTPException(status_code=500, detail=f"DB ping failed: {e}")
+
+@app.get("/api/health")
+async def health():
+    return {"status": "ok", "time": datetime.utcnow().isoformat()}
+
+# --- exemplo de endpoint para receber medições (se quiser) ---
 class Medicao(BaseModel):
-data_hora: str # "YYYY-MM-DD HH:MM:SS" or ISO
-cpu: float
-ram: float
+    client_id: str
+    timestamp: str  # isoformat
+    cpu: float
+    ram: float
 
-@validator("data_hora")
-def parse_dt(cls, v):
-# Accept common formats; keep as string here and parse later
-try:
-# try ISO first
-datetime.fromisoformat(v)
-except Exception:
-# try fallback
-try:
-datetime.strptime(v, "%Y-%m-%d %H:%M:%S")
-except Exception:
-raise ValueError("Formato data_hora inválido. Use ISO ou 'YYYY-MM-DD HH:MM:SS'")
-return v
+@app.post("/api/medicao")
+async def receber_medicao(m: Medicao):
+    """
+    Endpoint simples para aceitar uma medição. Por enquanto apenas retorna OK.
+    No futuro você salva no banco (INSERT) aqui.
+    """
+    # Exemplo mínimo de validação
+    if not m.client_id:
+        raise HTTPException(status_code=400, detail="client_id missing")
+    # TODO: salvar no banco (async/worker)
+    return {"received": True, "client": m.client_id, "ts": m.timestamp}
 
-class BatchIn(BaseModel):
-measurements: List[Medicao]
-api_key: Optional[str] = None
+# permite rodar localmente com python server/main.py
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("server.main:app", host="0.0.0.0", port=8000, reload=True)
 
-# ---------- App ----------
-app = FastAPI(title="Monitor de Recursos - Server")
-
-# serve static files from ./static at /static
-HERE = Path(__file__).parent
-STATIC_DIR = HERE / "static"
-if not STATIC_DIR.exists():
-STATIC_DIR.mkdir(parents=True, exist_ok=True)
-app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
-
-# init DB on startup
-@app.on_event("startup")
-def on_startup():
-logger.info("Inicializando DB...")
-init_db()
-logger.info("Startup completo.")
-
-# Health
-@app.get("/health")
-def health():
-return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
-
-# Ingest endpoint - agent posts a batch of measurements
-@app.post("/ingest", status_code=201)
-def ingest(data: BatchIn, request: Request):
-# optional API key check
-if API_KEY:
-# prefer header X-API-KEY or data.api_key
-key_header = request.headers.get("x-api-key")
-provided = key_header or data.api_key
-if provided != API_KEY:
-raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="API key inválida")
-
-rows = []
-for m in data.measurements:
-# parse datetime into python datetime
-try:
-dt = None
-try:
-dt = datetime.fromisoformat(m.data_hora)
-except Exception:
-dt = datetime.strptime(m.data_hora, "%Y-%m-%d %H:%M:%S")
-rows.append((dt, float(m.cpu), float(m.ram)))
-except Exception as e:
-raise HTTPException(status_code=400, detail=f"Erro ao parsear medicao: {e}")
-
-try:
-inserted = insert_batch(rows)
-return {"inserted": inserted}
-except Exception as e:
-logger.exception("Erro ao inserir lote")
-raise HTTPException(status_code=500, detail=str(e))
-
-# Get latest measurements (for UI)
-@app.get("/api/latest")
-def api_latest(limit: int = 100):
-try:
-rows = query_latest(limit)
-# rows are in desc order; we can reverse to ascending for plotting
-result = [
-{"id": r[0], "data_hora": r[1].isoformat(), "cpu": float(r[2]), "ram": float(r[3])}
-for r in reversed(rows)
-]
-return {"count": len(result), "data": result}
-except Exception as e:
-logger.exception("Erro ao consultar latest")
-raise HTTPException(status_code=500, detail=str(e))
-
-# Convenience: serve index or grafico
-@app.get("/")
-def index():
-index_file = STATIC_DIR / "control.html"
-if index_file.exists():
-return FileResponse(index_file)
-return {"message": "Coloque control.html em /server/static e recarregue."}
-
-# small endpoint to test DB connectivity quickly
-@app.get("/db-test")
-def db_test():
-try:
-rows = query_latest(1)
-return {"ok": True, "sample_count": len(rows)}
-except Exception as e:
-logger.exception("DB test falhou")
-raise HTTPException(status_code=500, detail=f"
