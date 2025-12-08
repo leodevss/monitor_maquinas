@@ -1,144 +1,169 @@
-# main.py
+import streamlit as st
+import pandas as pd
+import psycopg2
+import plotly.express as px
+from datetime import date, datetime, time
 import os
-import logging
-from datetime import datetime
-from typing import Optional
+from dotenv import load_dotenv
 
-from fastapi import FastAPI, HTTPException, Depends, Header
-from fastapi.responses import HTMLResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseSettings
-import asyncpg
+# --- CONFIGURAÇÃO DA PÁGINA ---
+st.set_page_config(
+    page_title="Sistema de Monitoramento Distribuído", 
+    layout="wide", 
+    page_icon="🖥️"
+)
 
-# -------------------------
-# Config
-# -------------------------
-class Settings(BaseSettings):
-    DATABASE_URL: Optional[str] = None
-    API_KEY: Optional[str] = ""
-    APP_TITLE: str = "Monitor de Recursos - Server"
+# --- ESTILO CSS ---
+st.markdown("""
+<style>
+    .stMetric {
+        background-color: #f0f2f6;
+        padding: 15px;
+        border-radius: 10px;
+        border: 1px solid #d6d6d8;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-    class Config:
-        env_file = ".env"
-        env_file_encoding = "utf-8"
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
 
-settings = Settings()
+# --- FUNÇÕES ---
+def get_status():
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+        cursor.execute("SELECT comando FROM controle_remoto WHERE id=1")
+        res = cursor.fetchone()
+        conn.close()
+        return res[0] if res else "DESCONHECIDO"
+    except: return "ERRO"
 
-# logging
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("monitor-server")
+def set_status(novo_status):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+        cursor.execute("UPDATE controle_remoto SET comando = %s WHERE id=1", (novo_status,))
+        conn.commit()
+        conn.close()
+    except Exception as e: st.error(str(e))
 
-if not settings.DATABASE_URL:
-    logger.warning("DATABASE_URL não configurada (env). Endpoints de DB irão falhar.")
+def get_data(start_date, start_time, end_date, end_time, limite):
+    try:
+        conn = psycopg2.connect(DB_URL)
+        timestamp_inicio = f"{start_date} {start_time}"
+        timestamp_fim = f"{end_date} {end_time}"
+        
+        query = f"""
+            SELECT hostname, data_hora, uso_cpu, uso_ram 
+            FROM monitoramento 
+            WHERE data_hora BETWEEN '{timestamp_inicio}' AND '{timestamp_fim}'
+            ORDER BY data_hora DESC
+        """
+        if limite != "Todos":
+            query += f" LIMIT {limite}"
+            
+        df = pd.read_sql(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        st.error(f"Erro na conexão: {e}")
+        return pd.DataFrame()
 
-# -------------------------
-# App & Static files
-# -------------------------
-app = FastAPI(title=settings.APP_TITLE)
+# --- HEADER ---
+st.title("🖥️ Monitoramento de Infraestrutura de TI")
+status_atual = get_status()
 
-# Mount static directory (mais eficiente que endpoint manual)
-static_dir = os.path.join(os.path.dirname(__file__), "static")
-if not os.path.isdir(static_dir):
-    os.makedirs(static_dir, exist_ok=True)  # opcional — cria pasta para evitar erros
-app.mount("/static", StaticFiles(directory=static_dir), name="static")
-
-# -------------------------
-# Pool de conexões (asyncpg)
-# -------------------------
-db_pool: Optional[asyncpg.pool.Pool] = None
-
-@app.on_event("startup")
-async def startup():
-    global db_pool
-    if settings.DATABASE_URL:
-        try:
-            db_pool = await asyncpg.create_pool(dsn=settings.DATABASE_URL, min_size=1, max_size=10)
-            logger.info("Pool de DB criado com sucesso.")
-        except Exception as e:
-            db_pool = None
-            logger.error(f"Falha ao criar pool de DB: {e}")
+kpi1, kpi2, kpi3 = st.columns(3)
+with kpi1:
+    if status_atual == 'INICIAR':
+        st.metric("Status do Sistema", "ONLINE 🟢", "Coletando")
     else:
-        logger.warning("DATABASE_URL ausente — pool de DB não criado.")
+        st.metric("Status do Sistema", "OFFLINE 🔴", "Parado")
 
-@app.on_event("shutdown")
-async def shutdown():
-    global db_pool
-    if db_pool:
-        await db_pool.close()
-        logger.info("Pool de DB fechado.")
+# --- SIDEBAR ---
+st.sidebar.header("⚙️ Configurações")
+st.sidebar.subheader("📅 Período")
+datas = st.sidebar.date_input("Datas", [date.today(), date.today()])
 
-# -------------------------
-# Helpers
-# -------------------------
-def require_api_key(x_api_key: Optional[str] = Header(None)):
-    """
-    Dependência simples para proteger endpoints sensíveis.
-    Você pode enviar header: X-API-KEY: <sua chave>
-    """
-    if not settings.API_KEY:
-        # chave não configurada -> não exigir (modo dev)
-        return True
-    if not x_api_key or x_api_key != settings.API_KEY:
-        raise HTTPException(status_code=401, detail="API key inválida")
-    return True
+st.sidebar.subheader("🕒 Horário")
+col_h1, col_h2 = st.sidebar.columns(2)
+with col_h1: hora_inicio = st.time_input("De:", time(0, 0))
+with col_h2: hora_fim = st.time_input("Até:", time(23, 59))
 
-# -------------------------
-# Endpoints
-# -------------------------
-@app.get("/", response_class=HTMLResponse)
-async def index():
-    html = """
-    <html><head><meta charset="utf-8"><title>Monitor</title></head>
-    <body>
-      <h2>Monitor de Recursos - Servidor</h2>
-      <p><a href="/static/grafico.html">Abrir gráfico</a></p>
-      <p><a href="/health">Health check</a></p>
-      <p><a href="/db_test">Testar conexão DB</a> (gera/insere/conta)</p>
-    </body></html>
-    """
-    return HTMLResponse(html)
+st.sidebar.subheader("📊 Visualização")
+limite_selecionado = st.sidebar.selectbox("Pontos no gráfico:", [100, 500, 1000, "Todos"], index=3) # Padrão 'Todos'
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "time": datetime.utcnow().isoformat() + "Z"}
+if st.sidebar.button("🔄 Atualizar", type="primary"):
+    st.rerun()
 
-@app.get("/db_test")
-async def db_test(_=Depends(require_api_key)):
-    """
-    Testa conexão com o banco:
-    - cria tabela de teste se não existir
-    - insere uma linha com timestamp e cpu%, ram%
-    - retorna a contagem de linhas da tabela
-    """
-    global db_pool
-    if not db_pool:
-        raise HTTPException(status_code=500, detail="Pool de DB não disponível. Verifique DATABASE_URL e logs.")
+# --- DASHBOARD ---
+if len(datas) == 2:
+    d_inicio, d_fim = datas
+    df = get_data(d_inicio, hora_inicio, d_fim, hora_fim, limite_selecionado)
 
-    async with db_pool.acquire() as conn:
-        # usar transação para segurança
-        async with conn.transaction():
-            # criar tabela (apenas para teste; use migrations em produção)
-            await conn.execute("""
-                CREATE TABLE IF NOT EXISTS measurements_test (
-                    id SERIAL PRIMARY KEY,
-                    ts TIMESTAMP NOT NULL,
-                    cpu_percent REAL,
-                    ram_percent REAL
-                );
-            """)
-            # inserir registro exemplo
-            row_id = await conn.fetchval(
-                "INSERT INTO measurements_test (ts, cpu_percent, ram_percent) VALUES (NOW(), $1, $2) RETURNING id;",
-                12.34, 56.78
-            )
-            total = await conn.fetchval("SELECT COUNT(*)::int FROM measurements_test;")
-    return {"inserted_id": int(row_id), "total_rows": int(total)}
+    if not df.empty:
+        df['data_hora'] = pd.to_datetime(df['data_hora'])
+        df = df.sort_values(by='data_hora', ascending=True)
+        
+        # Média Móvel
+        df['EMA_CPU'] = df.groupby('hostname')['uso_cpu'].transform(lambda x: x.ewm(span=10).mean())
+        df['EMA_RAM'] = df.groupby('hostname')['uso_ram'].transform(lambda x: x.ewm(span=10).mean())
 
-# rota alternativa para conferir arquivo estático (caso queira)
-@app.get("/static-check", response_class=HTMLResponse)
-async def static_check():
-    fp = os.path.join(static_dir, "grafico.html")
-    if not os.path.isfile(fp):
-        return HTMLResponse("<h3>grafico.html não encontrado em static/</h3>", status_code=404)
-    with open(fp, "r", encoding="utf-8") as f:
-        return HTMLResponse(f.read())
+        maquinas_unicas = df['hostname'].unique()
+        with kpi2: st.metric("Máquinas Ativas", f"{len(maquinas_unicas)}", "No período")
+        with kpi3: st.metric("Última Leitura", df['data_hora'].iloc[-1].strftime('%H:%M:%S'), "Horário")
+
+        st.divider()
+        c1, c2, _ = st.columns([1,1,3])
+        with c1: 
+            if st.button("▶️ INICIAR", use_container_width=True): set_status('INICIAR'); st.rerun()
+        with c2: 
+            if st.button("⏹️ PARAR", use_container_width=True): set_status('PARAR'); st.rerun()
+
+        # Abas
+        tab1, tab2 = st.tabs(["📈 Gráficos Interativos", "📋 Tabela de Dados"])
+
+        with tab1:
+            st.markdown(f"### Zoom Temporal ({hora_inicio} - {hora_fim})")
+            selected_hosts = st.multiselect("Selecione as máquinas:", maquinas_unicas, default=maquinas_unicas)
+            df_final = df[df['hostname'].isin(selected_hosts)]
+            
+            if not df_final.empty:
+                # Melt para plotar bruto e média
+                df_long_cpu = df_final.melt(id_vars=['data_hora', 'hostname'], value_vars=['uso_cpu', 'EMA_CPU'], 
+                                            var_name='Tipo', value_name='Valor')
+                df_long_ram = df_final.melt(id_vars=['data_hora', 'hostname'], value_vars=['uso_ram', 'EMA_RAM'], 
+                                            var_name='Tipo', value_name='Valor')
+
+                # --- GRÁFICO CPU ---
+                st.info("📊 **Processador (CPU)** | Use a barra inferior para dar Zoom")
+                fig_cpu = px.line(df_long_cpu, x='data_hora', y='Valor', color='hostname', line_dash='Tipo',
+                                  height=500, title=None)
+                
+                # ATIVANDO O ZOOM E SLIDER
+                fig_cpu.update_layout(hovermode="x unified")
+                fig_cpu.update_xaxes(rangeslider_visible=True) # <--- AQUI ESTÁ O ZOOM
+                
+                st.plotly_chart(fig_cpu, use_container_width=True)
+
+                st.markdown("---")
+
+                # --- GRÁFICO RAM ---
+                st.info("📊 **Memória (RAM)** | Use a barra inferior para dar Zoom")
+                fig_ram = px.line(df_long_ram, x='data_hora', y='Valor', color='hostname', line_dash='Tipo',
+                                  height=500, title=None)
+                
+                # ATIVANDO O ZOOM E SLIDER
+                fig_ram.update_layout(hovermode="x unified")
+                fig_ram.update_xaxes(rangeslider_visible=True) # <--- AQUI ESTÁ O ZOOM
+                
+                st.plotly_chart(fig_ram, use_container_width=True)
+            else:
+                st.warning("Selecione uma máquina.")
+
+        with tab2:
+            st.dataframe(df.sort_values(by='data_hora', ascending=False), use_container_width=True)
+
+    else:
+        st.warning(f"Sem dados no período.")

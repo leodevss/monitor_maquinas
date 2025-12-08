@@ -1,84 +1,72 @@
-# agent/agent.py
-import os, time, json, requests, psutil
+import psutil
+import sqlite3
+import time
+import psycopg2
+import os
+from dotenv import load_dotenv
 from datetime import datetime
-from pathlib import Path
-SERVER_URL = os.environ.get("SERVER_URL", "http://localhost:8000")
-API_KEY = os.environ.get("API_KEY", "minha-chave-teste")
-CLIENT_ID = os.environ.get("CLIENT_ID", "pc-001")
-INTERVAL = int(os.environ.get("INTERVALO_SEGUNDOS", "60"))
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "5")) # agent checa comando a
-cada 5s
-DATA_DIR = Path("data"); DATA_DIR.mkdir(exist_ok=True)
-BUFFER = DATA_DIR / "buffer.jsonl"
-HEADERS = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
-def get_command():
-try:
-r = requests.get(f"{SERVER_URL}/api/command/{CLIENT_ID}", timeout=5)
-r.raise_for_status()
-return r.json().get("command", "stop")
-except Exception as e:
-print("Erro ao buscar comando:", e)
-return "stop"
-def send_payload(payload):
-try:
-r = requests.post(f"{SERVER_URL}/api/collect", json=payload, headers=HEADERS,
-timeout=8)
-r.raise_for_status()
-return True
-except Exception as e:
-print("Falha ao enviar payload:", e)
-return False
-def flush_buffer():
-if not BUFFER.exists():
-return
-lines = BUFFER.read_text().strip().splitlines()
-remaining = []
-for l in lines:
-p = json.loads(l)
-if not send_payload(p):
-remaining.append(l)
-else:
-print("Buffered record flushed")
-if remaining:
-BUFFER.write_text("\n".join(remaining))
-else:
-try:
-BUFFER.unlink()
-except:
-pass
-def collect_once_and_send():
-payload = {
-"client_id": CLIENT_ID,
-"timestamp": datetime.utcnow().isoformat(),
-"cpu": psutil.cpu_percent(interval=1),
-"ram": psutil.virtual_memory().percent
-}
-if not send_payload(payload):
-# append to buffer
-with open(BUFFER, "a", encoding="utf-8") as f:
-f.write(json.dumps(payload) + "\n")
-def run_agent():
-active = False
-next_collect_at = 0
-while True:
-cmd = get_command()
-if cmd == "start":
-if not active:
-print("START command received - starting collection")
-active = True
-next_collect_at = time.time()
-# collect when time
-if active and time.time() >= next_collect_at:
-collect_once_and_send()
-flush_buffer()
-next_collect_at = time.time() + INTERVAL
-else:
-if active:
-print("STOP command received - stopping collection and flushing buffer")
-# flush remaining
-flush_buffer()
-active = False
-time.sleep(POLL_INTERVAL)
-if __name__ == "__main__":
-run_agent()
 
+# --- CONFIGURAÇÕES ---
+INTERVALO_CHECAGEM = 2  # Verifica o comando a cada 2s
+load_dotenv()
+DB_URL = os.getenv("DATABASE_URL")
+
+# Banco Local
+DB_LOCAL_PATH = os.path.join(os.path.dirname(__file__), 'data', 'buffer.db')
+os.makedirs(os.path.dirname(DB_LOCAL_PATH), exist_ok=True)
+
+def init_local_db():
+    conn = sqlite3.connect(DB_LOCAL_PATH)
+    cursor = conn.cursor()
+    cursor.execute('CREATE TABLE IF NOT EXISTS metricas (id INTEGER PRIMARY KEY, hostname TEXT, data_hora TEXT, cpu_uso REAL, ram_uso REAL)')
+    conn.commit()
+    conn.close()
+
+def verificar_permissao():
+    """Pergunta ao servidor se pode coletar"""
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+        cursor.execute("SELECT comando FROM controle_remoto WHERE id=1")
+        resultado = cursor.fetchone()
+        conn.close()
+        if resultado and resultado[0] == 'INICIAR':
+            return True
+        return False
+    except:
+        return False # Se der erro na internet, para por segurança
+
+def trabalhar_e_enviar():
+    # 1. Coleta
+    cpu = psutil.cpu_percent(interval=0.5)
+    ram = psutil.virtual_memory().percent
+    hostname = os.uname().nodename if hasattr(os, 'uname') else os.environ.get('COMPUTERNAME', 'Unknown')
+    agora = datetime.now().isoformat()
+
+    print(f"🟢 MONITORANDO: {hostname} | CPU: {cpu}% | RAM: {ram}%")
+
+    # 2. Envia DIRETO (Para ser rápido na apresentação)
+    try:
+        conn = psycopg2.connect(DB_URL)
+        cursor = conn.cursor()
+        cursor.execute("INSERT INTO monitoramento (hostname, data_hora, uso_cpu, uso_ram) VALUES (%s, %s, %s, %s)", 
+                      (hostname, agora, cpu, ram))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"⚠️ Erro de envio: {e}")
+
+if __name__ == "__main__":
+    init_local_db()
+    print("🤖 Agente ligado e aguardando comando do site...")
+    
+    while True:
+        # Pergunta para o "Chefe" (Banco de dados) se pode trabalhar
+        pode_coletar = verificar_permissao()
+        
+        if pode_coletar:
+            trabalhar_e_enviar()
+            time.sleep(2) # Coleta a cada 2 segundos se estiver ligado
+        else:
+            print("zzz... Aguardando 'Iniciar' no site...", end='\r')
+            time.sleep(3)

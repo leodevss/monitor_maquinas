@@ -1,17 +1,18 @@
-# virtual envs
+# Ignorar ambiente virtual
 venv/
-server/venv/
-agent/venv/
-
-# sensitive files
-.env
-server/.env
-agent/.env
-
-# python cache
+env/
 __pycache__/
 *.pyc
 
-# IDE
-.vscode/
-.idea/
+# Ignorar arquivos de configuração sensíveis (SENHAS)
+.env
+.env.txt
+
+# Ignorar banco de dados local temporário
+*.db
+*.sqlite3
+
+# Ignorar pasta de distribuição (se criou o .exe)
+dist/
+build/
+*.spec
